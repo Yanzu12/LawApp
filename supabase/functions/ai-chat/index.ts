@@ -1,120 +1,458 @@
-// 德理法律案例检索 API 配置
-const DELI_APPID = 'qHMfAfNYjhYHaajh';
-const DELI_SECRET = '0658DEC258D54A6BBE9190BB404E6206';
-const DELI_API_BASE = 'https://openapi.delilegal.com';
+// 元典开放平台·案例语义检索 API 配置
+// 密钥通过 `supabase secrets set YUANDIAN_API_KEY=...` 注入，不写入源码
+const YUANDIAN_API_BASE = 'https://open.chineselaw.com';
+const YUANDIAN_CASE_SEARCH_PATH = '/open/case_vector_search';
+const YUANDIAN_CASE_DETAIL_PATH = '/open/rh_case_details';
+const YUANDIAN_TIMEOUT_MS = 60_000;
 
-// 全局缓存 access_token
-let cachedToken: { token: string; expireTime: number } | null = null;
+// DeepSeek 官方模型名：deepseek-chat / deepseek-reasoner 已于 2026-07-24 下线，
+// 统一用 deepseek-flash 访问 DeepSeek-V4.1-Flash-1017
+const DEEPSEEK_DEFAULT_MODEL = 'deepseek-flash';
+const DEEPSEEK_LEGACY_MODEL_PATTERN = /^deepseek-(chat|reasoner|coder|v3[0-9.]*)(-|$)/i;
 
-// 获取德理 API access_token
-async function getDeliAccessToken(): Promise<string> {
-    // 检查缓存
-    if (cachedToken && cachedToken.expireTime > Date.now()) {
-        return cachedToken.token;
+// 输出长度不设上限：默认不传 max_tokens，由模型自身决定输出长度。
+// 如需限制，可在 api_configs.parameters 中配置 max_tokens 覆盖。
+
+// 截断提示文案，追加在正文末尾，避免用户误以为回答已完整
+const TRUNCATION_NOTICE = '\n\n> ⚠️ **本次回答因长度限制被截断**。你可以回复"继续"，我会接着往下写完。';
+
+function getYuandianApiKey(): string {
+    const key = (Deno.env.get('YUANDIAN_API_KEY') || Deno.env.get('YUANDIAN_KEY') || '').trim();
+    if (!key) {
+        throw new Error('缺少元典 API Key（YUANDIAN_API_KEY）');
+    }
+    return key;
+}
+
+// ========== 类型定义 ==========
+
+// 历史消息类型
+interface HistoryMessage {
+    role: 'user' | 'assistant';
+    content: string;
+}
+
+// 上下文管理配置
+const CONTEXT_CONFIG = {
+    MAX_ROUNDS: 5,                    // 最多保留5轮对话
+    MAX_TOTAL_LENGTH: 8000,           // 总字符数上限
+    MAX_SINGLE_MESSAGE_LENGTH: 4000,  // 单条消息最大长度
+    TRUNCATE_WARNING_THRESHOLD: 3500, // 单条消息截断警告阈值
+};
+
+// 数据库 base_prompts 不可用时的兜底系统提示词，保持与线上提示词同一套规则
+const DEFAULT_SYSTEM_PROMPT = `【身份】
+你是"吉林大学法学院 × 吉林大学计算机科学与技术学院"联合研发的法律知识助手，面向中国大陆法律体系提供咨询、法条解释、类案分析与实务建议。
+
+【回答总原则】
+1. 先给结论，再给依据，最后给动作。不要用开场白铺垫，不要复述用户问题。
+2. 事实不足时，先给"基于现有信息的初步判断"，再列出最多 3 项最关键的补充信息。
+3. 涉及法条写"法律名称 + 条文要点"，能确定条号就写条号；不确定就只写要点，绝不编造条号。
+4. 不承诺结果（"必胜""一定胜诉"），不虚构案号、法院、法官、司法解释。
+5. 同一问题存在多条路径时，用 A/B 方案对比成本、周期与风险。
+
+【使用检索到的案例】
+系统可能已为你注入"检索到的参考案例"。使用规则：
+1. 先判断相关性：只有当案例的争议焦点、案件事实类型与用户问题实质相同时才引用；仅是同一大类案由但争点不同的，明确说明"该案争点与您的问题不同"，不做牵强类比。
+2. 引用必须落地：写清"案号 + 法院 + 该案的裁判要点"，并说明它支持你哪一个结论。
+3. 案例只作论证参考，不作普遍规则。表述为"该案中法院认为……"，而不是"法律规定……"。
+4. 不得添加案例中没有的事实、数字、判决结果；不得改写案号。
+5. 若检索结果与问题关联度低，直接说明"本次检索未找到高度匹配的类案"，并给出检索建议（更准确的关键词、案由、地域），不要硬套。
+6. 每个引用案例最多展开 2-3 句裁判要旨，避免大段复述原文。
+
+【检索结果的呈现】
+1. 正文中不要重复罗列案例基本信息（案号、法院等由系统在文末统一附上）。
+2. 正文只写"参考价值"，即该案对用户问题的启示。
+3. 如果用户明确要求"找案例/类案检索"，可以按"案情相似度—裁判思路—对你的启示"整理成对照表。
+
+【输出结构（默认，按需裁剪）】
+一、结论摘要（2-4 条，直接可读）
+二、法律依据与适用逻辑
+三、结合本次事实的分析（事实→规则→结论）
+四、可执行建议（按时间顺序，写明"做什么、向谁做、带什么材料"）
+五、风险与边界（争议点、举证难点、时效/期限）
+六、仍需补充的信息（如有）
+
+【文书与文档】
+若消息包含"【文档内容】…【我的问题】…"，先基于文档事实作答，不要凭空假设文档中不存在的内容，然后补充法律分析。
+
+【语气】
+专业、克制、具体。避免官话套话与过度免责；仅在结尾用一句话提示风险边界。`;
+
+// ========== 元典案例语义检索 ==========
+
+interface YuandianCaseItem {
+    scid?: string;
+    title?: string;
+    ah?: string;
+    jbdw?: string;
+    ajlb?: string;
+    wszl?: string;
+    spcx?: string;
+    jand?: number;
+    jaDate?: number | string;
+    cj?: string;
+    content?: string;
+    xzqh_p?: string;
+    xzqh_c?: string;
+    score?: number;
+    ay?: string[];
+    anyou?: string[];
+    authority?: string;
+    db?: string;
+}
+
+interface CaseSearchOptions {
+    query: string;
+    returnNum: number;
+    wenshuType?: string;
+    causeList?: string[];
+    dianxing?: boolean;
+}
+
+const CASE_SECTION_MARKERS: Array<{ label: string; pattern: RegExp }> = [
+    { label: '案情摘要', pattern: /本案(?:的)?案件基本事实为[:：]?/ },
+    { label: '争议焦点', pattern: /争议焦点(?:在于|为|是)?[:：]?/ },
+    { label: '法院裁判理由', pattern: /(?:本院|法院|该院)认为[,，:：]?/ },
+];
+
+function stripCaseHtml(text: string): string {
+    return String(text || '')
+        .replace(/<em>/g, '')
+        .replace(/<\/em>/g, '')
+        .replace(/<strong>/g, '')
+        .replace(/<\/strong>/g, '')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\r\n/g, '\n')
+        .trim();
+}
+
+function formatYuandianDate(value?: number | string): string {
+    if (value === undefined || value === null || value === '') return '-';
+    const raw = String(value).trim();
+    if (/^\d{8}$/.test(raw)) {
+        return `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}`;
+    }
+    if (/^\d{4}-\d{2}-\d{2}/.test(raw)) return raw.slice(0, 10);
+    return raw;
+}
+
+/**
+ * 平台返回的 content 是整理后的案例内容（基本事实 + 争议焦点 + 裁判理由），
+ * 这里按司法说理节点切分为多个带标题的段落，便于前端折叠展示与文档导出。
+ */
+function splitCaseContentSections(content: string): Array<{ label: string; text: string }> {
+    const text = stripCaseHtml(content);
+    if (!text) return [];
+
+    const hits: Array<{ label: string; index: number }> = [];
+    for (const marker of CASE_SECTION_MARKERS) {
+        const match = marker.pattern.exec(text);
+        if (match && typeof match.index === 'number') {
+            hits.push({ label: marker.label, index: match.index });
+        }
     }
 
-    const tokenUrl = `${DELI_API_BASE}/oauth/authorize?appid=${DELI_APPID}&secret=${DELI_SECRET}&grant_type=client_credential`;
-    const response = await fetch(tokenUrl, { method: 'GET' });
-    
-    if (!response.ok) {
-        throw new Error('获取德理API token失败');
+    const uniqueHits = hits
+        .filter((hit, idx) => hits.findIndex(h => h.index === hit.index) === idx)
+        .sort((a, b) => a.index - b.index);
+
+    if (uniqueHits.length < 2) {
+        return [{ label: '案例内容', text }];
     }
 
-    const data = await response.json();
-    // 注意：accessToken 在响应数据的 body 字段中
-    const token = data.body?.accessToken;
-    
-    if (!token) {
-        console.error('德理API响应数据:', data);
-        console.error('期望在 data.body.accessToken 中找到 token');
-        throw new Error('获取德理API token失败: 响应格式错误');
+    const sections: Array<{ label: string; text: string }> = [];
+    for (let i = 0; i < uniqueHits.length; i++) {
+        const start = uniqueHits[i].index;
+        const end = i < uniqueHits.length - 1 ? uniqueHits[i + 1].index : text.length;
+        const sectionText = text.slice(start, end).trim();
+        if (sectionText) {
+            sections.push({ label: uniqueHits[i].label, text: sectionText });
+        }
     }
-    
-    console.log('德理API token 获取成功');
-    
-    // 缓存 token（假设有效期 2 小时）
-    cachedToken = {
-        token,
-        expireTime: Date.now() + 2 * 60 * 60 * 1000
+    return sections.length > 0 ? sections : [{ label: '案例内容', text }];
+}
+
+/** 将元典返回的文书对象规范化为前端 CaseData 结构 */
+function normalizeYuandianCase(item: YuandianCaseItem): any {
+    const contentSections = splitCaseContentSections(item.content || '');
+    const causeName = (Array.isArray(item.anyou) && item.anyou.length > 0 ? item.anyou[0] : '') || '';
+
+    return {
+        scid: item.scid || '',
+        title: item.title || '未命名案例',
+        caseNumber: item.ah || '-',
+        court: item.jbdw || '-',
+        caseType: item.ajlb || '',
+        causeName,
+        cause: causeName,
+        judgementType: item.wszl || '判决书',
+        judgementDate: formatYuandianDate(item.jaDate),
+        levelOfTrial: item.spcx || '-',
+        content: stripCaseHtml(item.content || ''),
+        similarity: typeof item.score === 'number' ? Number(item.score.toFixed(4)) : null,
+        authority: item.authority || '',
+        sourceDb: item.db || '',
+        region: [item.xzqh_p, item.xzqh_c].filter(Boolean).join(' '),
+        courtLevel: item.cj || '',
+        detail: {
+            data: {
+                docResult: contentSections,
+                content: stripCaseHtml(item.content || '')
+            }
+        }
+    };
+}
+
+/** 调用元典「案例语义检索」接口 */
+async function searchCasesBySemantic(options: CaseSearchOptions): Promise<any[] | null> {
+    const apiKey = getYuandianApiKey();
+    const url = `${YUANDIAN_API_BASE}${YUANDIAN_CASE_SEARCH_PATH}`;
+
+    const wenshuFilter: Record<string, any> = {};
+    if (options.wenshuType) wenshuFilter.wenshu_type = options.wenshuType;
+    if (Array.isArray(options.causeList) && options.causeList.length > 0) {
+        wenshuFilter.ay = options.causeList.slice(0, 5);
+    }
+    if (typeof options.dianxing === 'boolean') wenshuFilter.dianxing = options.dianxing;
+
+    const payload: Record<string, any> = {
+        query: options.query,
+        rewrite_flag: true,
+        return_num: Math.min(Math.max(options.returnNum, 1), 45)
+    };
+    if (Object.keys(wenshuFilter).length > 0) {
+        payload.wenshu_filter = wenshuFilter;
+    }
+
+    console.log('元典语义检索请求:', JSON.stringify({ ...payload, query: payload.query.slice(0, 120) }));
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), YUANDIAN_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'X-API-Key': apiKey,
+                'Content-Type': 'application/json; charset=utf-8',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('元典语义检索失败:', response.status, errorText.slice(0, 500));
+            return null;
+        }
+
+        const result = await response.json();
+        const items: YuandianCaseItem[] = Array.isArray(result?.extra?.wenshu) ? result.extra.wenshu : [];
+        console.log('元典语义检索响应:', { code: result?.code, msg: result?.msg, count: items.length });
+
+        return items
+            .filter(item => item && (item.title || item.content))
+            .map(normalizeYuandianCase);
+    } catch (error: any) {
+        if (error?.name === 'AbortError') {
+            console.error('元典语义检索超时');
+        } else {
+            console.error('元典语义检索异常:', error);
+        }
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// ========== 元典案例详情 ==========
+
+/** 普通案例的各正文段落字段（按裁判文书常规顺序） */
+const PT_DETAIL_SECTIONS: Array<{ key: string; label: string }> = [
+    { key: 'dsr', label: '当事人' },
+    { key: 'ssjl', label: '诉讼记录' },
+    { key: 'ajjbqk', label: '案件基本情况' },
+    { key: 'cmss', label: '查明事实' },
+    { key: 'ayjd', label: '争议焦点' },
+    { key: 'fxgc', label: '分析过程' },
+    { key: 'pjjg', label: '判决结果' },
+    { key: 'ww', label: '文尾' },
+];
+
+/** 案件基本情况的细分段落，仅在缺少 ajjbqk 整体段时使用 */
+const PT_DETAIL_SUB_SECTIONS: Array<{ key: string; label: string }> = [
+    { key: 'ajjbqk_zk', label: '指控' },
+    { key: 'ajjbqk_bh', label: '辩护' },
+    { key: 'ajjbqk_zj', label: '证据' },
+    { key: 'ajjbqk_bssl', label: '本审审理' },
+];
+
+/** 把详情接口返回的原始对象拆成带标题的段落 */
+function buildCaseDetailSections(detail: any): Array<{ label: string; text: string }> {
+    if (!detail) return [];
+
+    // 权威案例：section 已经是 [{name, value}]
+    if (Array.isArray(detail.section)) {
+        const sections = detail.section
+            .filter((s: any) => s && typeof s.value === 'string' && s.value.trim())
+            .map((s: any) => ({ label: s.name || '段落', text: stripCaseHtml(s.value) }));
+        if (sections.length > 0) return sections;
+    }
+
+    // 普通案例：按固定字段顺序拼装
+    const sections: Array<{ label: string; text: string }> = [];
+    const hasWholeFacts = typeof detail.ajjbqk === 'string' && detail.ajjbqk.trim().length > 0;
+
+    for (const { key, label } of PT_DETAIL_SECTIONS) {
+        const value = detail[key];
+        if (typeof value === 'string' && value.trim()) {
+            sections.push({ label, text: stripCaseHtml(value) });
+        }
+        // 没有整体"案件基本情况"时，用细分段落补上
+        if (key === 'ajjbqk' && !hasWholeFacts) {
+            for (const sub of PT_DETAIL_SUB_SECTIONS) {
+                const subValue = detail[sub.key];
+                if (typeof subValue === 'string' && subValue.trim()) {
+                    sections.push({ label: sub.label, text: stripCaseHtml(subValue) });
+                }
+            }
+        }
+    }
+
+    if (sections.length === 0 && typeof detail.content === 'string' && detail.content.trim()) {
+        sections.push({ label: '正文', text: stripCaseHtml(detail.content) });
+    }
+
+    return sections;
+}
+
+// 详情按次计费（10 POINT/次），本轮内同一案例只取一次
+const caseDetailCache = new Map<string, any>();
+
+async function requestCaseDetail(params: URLSearchParams): Promise<any | null> {
+    const apiKey = getYuandianApiKey();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), YUANDIAN_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(
+            `${YUANDIAN_API_BASE}${YUANDIAN_CASE_DETAIL_PATH}?${params.toString()}`,
+            {
+                method: 'GET',
+                headers: { 'X-API-Key': apiKey, 'Accept': 'application/json' },
+                signal: controller.signal
+            }
+        );
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            console.error('元典案例详情失败:', response.status, errorText.slice(0, 300));
+            return null;
+        }
+
+        const result = await response.json();
+        const list = Array.isArray(result?.data) ? result.data : [];
+        return list.length > 0 ? list[0] : null;
+    } catch (error: any) {
+        console.error('元典案例详情异常:', error?.name === 'AbortError' ? '超时' : error);
+        return null;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * 拉取单条案例详情。
+ * 检索结果只带整理后的摘要，详情接口才返回分段正文（当事人/查明事实/分析过程/判决结果等）。
+ * 优先用 id，失败再退回按案号查询。
+ */
+async function fetchCaseDetail(caseItem: any): Promise<any | null> {
+    const cacheKey = caseItem.scid || caseItem.caseNumber;
+    if (cacheKey && caseDetailCache.has(cacheKey)) {
+        return caseDetailCache.get(cacheKey);
+    }
+
+    const type = caseItem.authority ? 'qwal' : 'ptal';
+    const attempts: URLSearchParams[] = [];
+
+    const id = String(caseItem.scid || '').trim();
+    const ah = String(caseItem.caseNumber || '').trim();
+    const hasAh = ah && ah !== '-';
+
+    if (id) {
+        const p = new URLSearchParams({ id });
+        p.set('type', type);
+        attempts.push(p);
+        attempts.push(new URLSearchParams({ id }));
+    }
+    if (hasAh) {
+        const p = new URLSearchParams({ ah });
+        p.set('type', type);
+        attempts.push(p);
+        attempts.push(new URLSearchParams({ ah }));
+    }
+
+    let detail: any = null;
+    for (const params of attempts) {
+        detail = await requestCaseDetail(params);
+        if (detail) break;
+    }
+
+    if (detail && cacheKey) {
+        caseDetailCache.set(cacheKey, detail);
+    }
+    return detail;
+}
+
+/** 检索结果 + 详情 合并成前端可直接渲染的案例结构 */
+function mergeCaseWithDetail(caseItem: any, detail: any): any {
+    const sections = buildCaseDetailSections(detail);
+    const merged = {
+        ...caseItem,
+        // 详情接口字段更权威，覆盖检索结果的同名字段
+        title: detail?.title || caseItem.title,
+        caseNumber: detail?.ah || caseItem.caseNumber,
+        court: detail?.jbdw || caseItem.court,
+        caseType: detail?.ajlb || caseItem.caseType,
+        causeName: detail?.ay || caseItem.causeName,
+        cause: detail?.ay || caseItem.cause,
+        judgementType: detail?.wszl || caseItem.judgementType,
+        judgementDate: detail?.cprq ? formatYuandianDate(detail.cprq) : caseItem.judgementDate,
+        levelOfTrial: detail?.spcx || caseItem.levelOfTrial,
+        region: [detail?.xzqh_p, detail?.xzqh_c].filter(Boolean).join(' ') || caseItem.region,
+        judges: Array.isArray(detail?.judge) ? detail.judge.map((j: any) => j?.name).filter(Boolean) : [],
+        lawyers: Array.isArray(detail?.lawyer)
+            ? detail.lawyer
+                .map((l: any) => {
+                    const name = String(l?.name || '').trim();
+                    const firm = String(l?.lawFirm || '').trim();
+                    if (name && firm) return `${name}（${firm}）`;
+                    return name || firm;
+                })
+                .filter(Boolean)
+            : [],
+        citedStatutes: detail?.yyft || '',
     };
 
-    return token;
-}
-
-// 搜索相关案例
-async function searchCases(keyword: string, token: string, pageSize: number = 3) {
-    const searchUrl = `${DELI_API_BASE}/api/qa/v2/search/queryListCase`;
-    
-    // 将关键词字符串分割成数组（如果包含空格）
-    const keywordArr = keyword.includes(' ') 
-        ? keyword.split(' ').filter(k => k.trim().length > 0)
-        : [keyword];
-    
-    console.log('搜索关键词数组:', keywordArr);
-    
-    const response = await fetch(searchUrl, {
-        method: 'POST',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': token
-        },
-        body: JSON.stringify({
-            pageNo: 1,
-            pageSize,
-            sortField: 'correlation',
-            sortOrder: 'desc',
-            condition: {
-                keywordArr: keywordArr
+    if (sections.length > 0) {
+        merged.content = sections.map(s => s.text).join('\n\n');
+        merged.detail = {
+            data: {
+                docResult: sections,
+                content: merged.content,
+                judgeInfo: merged.judges.join('、'),
+                caseType: detail?.ajlx || ''
             }
-        })
-    });
-    
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error('案例搜索失败:', response.status, errorText);
-        return null;
+        };
+    } else {
+        merged.detail = { data: { docResult: [], content: caseItem.content || '' } };
     }
 
-    const result = await response.json();
-    console.log('案例搜索响应:', { success: result.success, code: result.code, dataCount: result.body?.data?.length });
-    
-    // 响应数据在 body 字段中
-    if (!result.body) {
-        console.error('响应中没有 body 字段:', result);
-        return null;
-    }
-    
-    return result.body;
-}
-
-// 获取案例详情
-async function getCaseDetail(caseId: string, token: string) {
-    const detailUrl = `${DELI_API_BASE}/api/qa/v2/search/caseInfo?caseId=${caseId}`;
-    const response = await fetch(detailUrl, {
-        method: 'GET',
-        headers: {
-            'Content-Type': 'application/json',
-            'Authorization': token
-        }
-    });
-
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error('获取案例详情失败:', response.status, errorText);
-        return null;
-    }
-
-    const result = await response.json();
-    console.log('案例详情响应:', { success: result.success, code: result.code, hasBody: !!result.body });
-    
-    // 响应数据在 body 字段中，注意：详情数据直接在 body 中，不在 body.data 中
-    if (!result.body) {
-        console.error('响应中没有 body 字段:', result);
-        return null;
-    }
-    
-    // 返回包含 data 属性的对象以保持与搜索结果的一致性
-    return { data: result.body };
+    merged.detailFetched = sections.length > 0;
+    return merged;
 }
 
 interface CollectedCaseData {
@@ -122,15 +460,39 @@ interface CollectedCaseData {
     detailedCases: any[];
 }
 
-interface CaseAppendix {
-    appendText: string;
-    caseCount: number;
-}
-
 interface ModelCallResult {
     content: string;
+    reasoningContent?: string;
     tokensUsed: number;
     responseTime: number;
+    modelUsed?: string;
+    /** 模型因长度上限提前结束输出（finish_reason === 'length'） */
+    truncated?: boolean;
+}
+
+/**
+ * 解析实际调用的 DeepSeek 模型名。
+ * V4.1-Flash 起，thinking 不再靠切换模型名（deepseek-reasoner）实现，
+ * 而是同一个 deepseek-flash 通过 thinking 参数开关思维链，
+ * 因此这里统一返回 deepseek-flash，并过滤掉已下线的旧模型名。
+ */
+function resolveDeepSeekModelName(apiConfig: any, _enableThinking: boolean): string {
+    const configuredModel = String(apiConfig?.model_name || '').trim();
+    if (!configuredModel) {
+        return DEEPSEEK_DEFAULT_MODEL;
+    }
+    if (DEEPSEEK_LEGACY_MODEL_PATTERN.test(configuredModel)) {
+        console.log(`DeepSeek 模型名 ${configuredModel} 已下线，自动切换到 ${DEEPSEEK_DEFAULT_MODEL}`);
+        return DEEPSEEK_DEFAULT_MODEL;
+    }
+    return configuredModel;
+}
+
+/** 构造 DeepSeek thinking 参数：开启走 enabled，关闭走 disabled（默认是开启且 effort=high） */
+function buildDeepSeekThinkingParam(enableThinking: boolean): Record<string, any> {
+    return {
+        thinking: { type: enableThinking ? 'enabled' : 'disabled' }
+    };
 }
 
 function chunkTextForStream(text: string): string[] {
@@ -274,7 +636,333 @@ async function saveConversationMessage(options: {
     }
 }
 
-async function collectCaseContext(message: string, enableCaseSearch: boolean, caseCount: number = 1): Promise<CollectedCaseData> {
+
+// 获取会话历史（最近N轮）
+async function getConversationHistory(
+    supabaseUrl: string,
+    serviceRoleKey: string,
+    sessionId: string,
+    maxRounds: number = 5
+): Promise<HistoryMessage[]> {
+    try {
+        // 获取最近的消息，user和assistant交替出现，所以取 maxRounds * 2 条
+        const limit = maxRounds * 2;
+        const response = await fetch(
+            `${supabaseUrl}/rest/v1/conversations?session_id=eq.${sessionId}&order=created_at.desc&limit=${limit}`,
+            {
+                headers: {
+                    'Authorization': `Bearer ${serviceRoleKey}`,
+                    'apikey': serviceRoleKey,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+
+        if (!response.ok) {
+            console.error('获取历史消息失败');
+            return [];
+        }
+
+        const messages = await response.json();
+
+        // 反转顺序（从旧到新）
+        const sortedMessages = messages.reverse();
+
+        // 转换为标准格式
+        // 助手消息末尾带有案例数据注释（供前端还原卡片），
+        // 这里必须剥离，否则会被当作正文喂回模型，污染上下文。
+        return sortedMessages.map((msg: any) => ({
+            role: msg.message_type === 'user' ? 'user' : 'assistant',
+            content: stripRelatedCasesMeta(msg.message_content || '')
+        }));
+    } catch (error) {
+        console.error('获取会话历史出错:', error);
+        return [];
+    }
+}
+
+// 计算消息的大概token数（粗略估算：中文约1.5字符/token，英文约4字符/token）
+function estimateTokens(text: string): number {
+    if (!text) return 0;
+    // 统计中文字符数
+    const chineseChars = (text.match(/[一-龥]/g) || []).length;
+    // 统计其他字符数
+    const otherChars = text.length - chineseChars;
+    // 估算：中文 1.5字符/token，英文 4字符/token
+    return Math.ceil(chineseChars / 1.5 + otherChars / 4);
+}
+
+// 截断单条消息内容
+function truncateSingleMessage(content: string, maxLength: number): string {
+    if (content.length <= maxLength) {
+        return content;
+    }
+
+    const truncated = content.substring(0, maxLength - 50);
+    return truncated + '\n...[内容过长已截断]';
+}
+
+// 管理上下文窗口：保留最近N轮对话，并控制总长度
+function manageContextWindow(history: HistoryMessage[]): {
+    managedHistory: HistoryMessage[];
+    warnings: string[];
+} {
+    const warnings: string[] = [];
+
+    // 1. 截断过长的单条消息
+    let processedHistory = history.map((msg, index) => {
+        if (msg.content.length > CONTEXT_CONFIG.MAX_SINGLE_MESSAGE_LENGTH) {
+            warnings.push(`消息${index + 1}过长(${msg.content.length}字符)，已截断至${CONTEXT_CONFIG.MAX_SINGLE_MESSAGE_LENGTH}字符`);
+            return {
+                ...msg,
+                content: truncateSingleMessage(msg.content, CONTEXT_CONFIG.MAX_SINGLE_MESSAGE_LENGTH)
+            };
+        }
+        return msg;
+    });
+
+    // 2. 限制轮数：最多保留5轮对话（10条消息）
+    if (processedHistory.length > CONTEXT_CONFIG.MAX_ROUNDS * 2) {
+        const removed = processedHistory.length - CONTEXT_CONFIG.MAX_ROUNDS * 2;
+        processedHistory = processedHistory.slice(-CONTEXT_CONFIG.MAX_ROUNDS * 2);
+        warnings.push(`历史消息超过${CONTEXT_CONFIG.MAX_ROUNDS}轮，已移除最早的${removed}条消息`);
+    }
+
+    // 3. 控制总字符数
+    let totalLength = processedHistory.reduce((sum, msg) => sum + msg.content.length, 0);
+
+    while (totalLength > CONTEXT_CONFIG.MAX_TOTAL_LENGTH && processedHistory.length > 0) {
+        const removed = processedHistory.shift();
+        if (removed) {
+            totalLength -= removed.content.length;
+            warnings.push(`总字符数超限，移除最早的1条消息`);
+        }
+    }
+
+    return {
+        managedHistory: processedHistory,
+        warnings
+    };
+}
+
+// 构建多轮对话消息列表（用于发送给AI模型）
+function buildMultiRoundMessages(
+    systemPrompt: string,
+    history: HistoryMessage[],
+    currentMessage: string
+): Array<{ role: string; content: string }> {
+    const messages: Array<{ role: string; content: string }> = [
+        { role: 'system', content: systemPrompt }
+    ];
+
+    // 添加历史消息
+    for (const msg of history) {
+        messages.push({
+            role: msg.role,
+            content: msg.content
+        });
+    }
+
+    // 添加当前用户消息
+    messages.push({
+        role: 'user',
+        content: currentMessage
+    });
+
+    return messages;
+}
+
+/**
+ * 把最近几轮对话压成检索用的上下文片段。
+ * 检索不能被单句孤立理解——用户第二句往往是"那如果……""这种情况呢"，
+ * 脱离上文会检索到完全不相关的案例。
+ */
+function buildHistoryBrief(history: HistoryMessage[], maxRounds: number = 3): string {
+    if (!history || history.length === 0) return '';
+
+    const recent = history.slice(-maxRounds * 2);
+    const lines: string[] = [];
+
+    for (const msg of recent) {
+        const text = String(msg.content || '').trim();
+        if (!text) continue;
+        // 历史里的助手回复带有案例附录，检索只关心法律要点，做一次粗剪
+        const cleaned = text.split('## 📚 相关法律案例参考')[0].trim();
+        if (!cleaned) continue;
+        const excerpt = cleaned.length > 300 ? `${cleaned.slice(0, 300)}…` : cleaned;
+        lines.push(`${msg.role === 'user' ? '用户' : '助手'}：${excerpt}`);
+    }
+
+    return lines.join('\n');
+}
+
+// AI智能分析用户问题，产出语义检索所需的过滤条件
+async function analyzeQuestionWithAI(message: string, apiConfig: any, history: HistoryMessage[] = []): Promise<any> {
+    const historyBrief = buildHistoryBrief(history);
+    const historyBlock = historyBrief
+        ? `\n对话上文（供理解指代与追问）：\n${historyBrief}\n`
+        : '\n（这是本轮对话的第一个问题，没有上文）\n';
+
+    const analysisPrompt = `你是法律案例检索助手。系统会对"检索用查询语句"做语义检索（不做关键词分词），
+你的任务是把它补全成一个脱离上下文也能独立理解的检索句，并给出过滤条件。
+
+当前用户输入：
+${message}
+${historyBlock}
+请只返回 JSON，不要任何解释文字：
+{
+  "searchQuery": "补全后的检索查询语句",  // 关键：把上文中的事实、主体、法律关系合并进来；若当前输入已完整则原样返回
+  "caseType": "民事案件/刑事案件/行政案件/执行案件/其他",  // 若无法判断填"其他"
+  "cause": "规范案由名称",  // 例如：劳动合同纠纷、民间借贷纠纷、机动车交通事故责任纠纷、盗窃罪；无法判断填空字符串
+  "keywords": ["关键词1", "关键词2", "关键词3"],  // 仅作检索补充提示，最多3个，必须是法律术语而非口语
+  "partyStanding": "原告方/被告方/不明显",  // 用户站在哪一方，用于调整回答视角
+  "userIntent": "一句话概括用户真正想解决的问题"
+}
+
+规则：
+1. searchQuery 必须自包含：把"他/这个/那如果/这种情况"等指代替换成上文的具体主体与事实。
+2. 若当前输入引入了新事实，searchQuery 以本轮新事实为主，上文仅用于补全指代。
+3. 不要臆造上文没有的事实；信息不足时按当前输入原样检索。
+4. 案由必须使用《民事案件案由规定》或刑事罪名中的规范表述，不要自造。
+5. 不确定就留空，不要猜测案件类型。`;
+
+    try {
+        const providerType = String(apiConfig.api_provider || '').toLowerCase();
+
+        if (providerType.includes('deepseek')) {
+            const apiUrl = resolveApiUrl(
+                apiConfig.api_endpoint,
+                apiConfig.api_host,
+                'https://api.deepseek.com/v1/chat/completions',
+                '/v1/chat/completions',
+                'DeepSeek'
+            );
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${apiConfig.api_key}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: resolveDeepSeekModelName(apiConfig, false),
+                    messages: [{ role: 'user', content: analysisPrompt }],
+                    temperature: 0.3,  // 低温度保证输出稳定
+                    max_tokens: 500,
+                    // 分析任务只求结构化输出，关闭思维链以降低延迟
+                    ...buildDeepSeekThinkingParam(false)
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error('AI分析失败');
+            }
+
+            const data = await response.json();
+            const content = data.choices?.[0]?.message?.content || '';
+
+            // 提取JSON内容
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+        } else {
+            // 使用通义千问
+            const apiUrl = resolveApiUrl(
+                apiConfig.api_endpoint,
+                apiConfig.api_host,
+                'https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation',
+                '/api/v1/services/aigc/text-generation/generation',
+                'Qwen'
+            );
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${apiConfig.api_key}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    model: apiConfig.model_name || 'qwen-turbo',
+                    input: {
+                        messages: [{ role: 'user', content: analysisPrompt }]
+                    },
+                    parameters: {
+                        max_tokens: 500,
+                        temperature: 0.3,
+                        result_format: 'message'
+                    }
+                })
+            });
+
+            if (!response.ok) {
+                throw new Error('AI分析失败');
+            }
+
+            const data = await response.json();
+            const content = data.output?.text || data.output?.choices?.[0]?.message?.content || '';
+
+            // 提取JSON内容
+            const jsonMatch = content.match(/\{[\s\S]*\}/);
+            if (jsonMatch) {
+                return JSON.parse(jsonMatch[0]);
+            }
+        }
+    } catch (error) {
+        console.error('AI问题分析出错:', error);
+    }
+
+    // 如果AI分析失败，返回默认值
+    return null;
+}
+
+/**
+ * 语义检索吃的是自然语言案情描述。
+ * 优先用 AI 结合上文补全后的 searchQuery（能解决"那这种情况呢"这类指代），
+ * 拿不到时退回本条消息原文。
+ */
+function buildSemanticQuery(message: string, aiAnalysis: any): string {
+    const docMatch = message.match(/【我的问题】([\s\S]*)$/);
+    const question = (docMatch ? docMatch[1] : message).trim();
+
+    const rewritten = String(aiAnalysis?.searchQuery || '').trim();
+    const base = rewritten || question || message;
+
+    const extraHints: string[] = [];
+    if (aiAnalysis?.cause) extraHints.push(String(aiAnalysis.cause));
+    if (Array.isArray(aiAnalysis?.keywords) && aiAnalysis.keywords.length > 0) {
+        extraHints.push(aiAnalysis.keywords.slice(0, 3).join('、'));
+    }
+
+    // 检索原文控制在合理长度内，过长的文档正文会稀释语义检索的指向性
+    const trimmed = base.length > 400 ? base.slice(0, 400) : base;
+
+    return extraHints.length > 0 ? `${trimmed}（${extraHints.join('；')}）` : trimmed;
+}
+
+/** 把 AI 分析出的案件类型映射到元典 wenshu_type 枚举 */
+function normalizeWenshuType(caseType?: string): string | undefined {
+    if (!caseType) return undefined;
+    const value = String(caseType).trim();
+    const allowed = [
+        '刑事案件', '民事案件', '行政案件', '执行案件',
+        '管辖案件', '国家赔偿与司法救助案件', '强制清算与破产案件'
+    ];
+    if (allowed.includes(value)) return value;
+    if (value.includes('民事')) return '民事案件';
+    if (value.includes('刑事')) return '刑事案件';
+    if (value.includes('行政')) return '行政案件';
+    if (value.includes('执行')) return '执行案件';
+    return undefined;
+}
+
+async function collectCaseContext(
+    message: string,
+    enableCaseSearch: boolean,
+    caseCount: number = 1,
+    apiConfig: any,
+    history: HistoryMessage[] = []
+): Promise<CollectedCaseData> {
     let systemPromptAddon = '';
     const detailedCases: any[] = [];
 
@@ -283,99 +971,94 @@ async function collectCaseContext(message: string, enableCaseSearch: boolean, ca
     }
 
     try {
-        const deliToken = await getDeliAccessToken();
-        console.log('德理 API token 获取成功');
-
-        let searchKeyword = message;
-        if (message.length > 30) {
-            const legalKeywords = [
-                '合同', '协议', '违约', '解除', '终止', '履行', '订立', '效力',
-                '侵权', '赔偿', '损害', '补偿', '过错', '责任',
-                '离婚', '抚养', '抚养费', '探望', '继承', '遗产', '遗嘱', '赡养',
-                '劳动', '工伤', '辞退', '解雇', '加班', '社保', '工资', '竞业',
-                '房产', '房屋', '买卖', '租赁', '拆迁', '征收', '物业',
-                '交通', '事故', '肇事', '车祸',
-                '刑事', '犯罪', '盗窃', '诈骗', '故意', '过失', '缓刑', '假释',
-                '诉讼', '起诉', '上诉', '再审', '执行', '仲裁', '调解', '和解',
-                '纠纷', '争议', '判决', '裁定', '民事', '行政', '医疗', '土地'
-            ];
-
-            let extractedKeywords: string[] = [];
-            for (const keyword of legalKeywords) {
-                if (message.includes(keyword)) {
-                    extractedKeywords.push(keyword);
-                }
-            }
-            extractedKeywords = [...new Set(extractedKeywords)];
-
-            if (extractedKeywords.length > 0) {
-                searchKeyword = extractedKeywords.slice(0, 3).join(' ');
-                console.log(`从问题中提取的法律关键词: ${searchKeyword}`);
-            } else {
-                let cleaned = message
-                    .replace(/请问|咨询|想问|怎么办|如何|什么|哪些|能否|可以|应该|需要|想要|帮我|告诉|说明/g, '')
-                    .replace(/我|你|他|她|它|们|的|了|吗|呢|啊|吧|呀/g, '')
-                    .replace(/[，。！？；：、\s]+/g, ' ')
-                    .trim();
-
-                searchKeyword = cleaned.substring(0, 20).trim();
-
-                if (searchKeyword.length < 5) {
-                    searchKeyword = message.substring(0, 20).trim();
-                }
-
-                console.log(`文本清洗后的关键词: ${searchKeyword}`);
-            }
+        // 语义检索内部会做查询改写，AI 分析负责结合上文补全检索句 + 补充过滤条件；
+        // 分析失败不影响检索，因此容错处理。
+        console.log('正在分析用户问题并准备语义检索...');
+        const aiAnalysis = await analyzeQuestionWithAI(message, apiConfig, history).catch(() => null);
+        if (aiAnalysis) {
+            console.log('AI分析结果:', {
+                searchQuery: aiAnalysis.searchQuery,
+                keywords: aiAnalysis.keywords,
+                caseType: aiAnalysis.caseType,
+                cause: aiAnalysis.cause
+            });
         }
 
-        console.log(`最终搜索关键词: ${searchKeyword}`);
+        const query = buildSemanticQuery(message, aiAnalysis);
+        const requestCount = Math.min(Math.max(caseCount, 1), 10);
+        const wenshuType = normalizeWenshuType(aiAnalysis?.caseType);
+        const causeList = aiAnalysis?.cause ? [String(aiAnalysis.cause)] : undefined;
 
-        const searchResult = await searchCases(searchKeyword, deliToken, caseCount);
-        if (searchResult && searchResult.data && searchResult.data.length > 0) {
-            console.log(`找到 ${searchResult.data.length} 个相关案例`);
-            for (const caseItem of searchResult.data) {
-                try {
-                    const caseDetail = await getCaseDetail(caseItem.id, deliToken);
-                    if (caseDetail && caseDetail.data) {
-                        detailedCases.push({
-                            ...caseItem,
-                            detail: caseDetail.data
-                        });
-                    } else {
-                        detailedCases.push(caseItem);
+        let cases = await searchCasesBySemantic({
+            query,
+            returnNum: requestCount,
+            wenshuType,
+            causeList
+        });
+
+        // 案由/案件类别是精确枚举过滤，AI 判断偏差时会直接查空。
+        // 命中为空时退化为纯语义检索，保证至少能返回相似案例。
+        if ((!cases || cases.length === 0) && (wenshuType || causeList)) {
+            console.log('带过滤条件未命中，去掉过滤条件重试');
+            cases = await searchCasesBySemantic({ query, returnNum: requestCount });
+        }
+
+        if (cases && cases.length > 0) {
+            console.log(`找到 ${cases.length} 个相关案例，开始拉取案例详情`);
+
+            // 检索接口只返回整理后的摘要，详情接口才有分段正文。
+            // 详情按次计费，因此只对最终展示的条数拉取，并并行请求。
+            const detailResults = await Promise.all(
+                cases.map(async (item) => {
+                    try {
+                        const detail = await fetchCaseDetail(item);
+                        return detail ? mergeCaseWithDetail(item, detail) : item;
+                    } catch (error) {
+                        console.error('拉取案例详情失败:', item?.title, error);
+                        return item;
                     }
-                } catch (detailError) {
-                    console.error(`获取案例详情失败 (${caseItem.id}):`, detailError);
-                    detailedCases.push(caseItem);
+                })
+            );
+
+            const withDetail = detailResults.filter(item => item?.detailFetched).length;
+            console.log(`案例详情拉取完成: ${withDetail}/${detailResults.length} 条成功`);
+            detailedCases.push(...detailResults);
+
+            let casesContext = '\n\n## 检索到的参考案例（按语义相似度降序）\n';
+            casesContext += '> 以下是从案例库中语义检索到的真实案例，可用于论证参考。引用时必须使用其原始案号与法院，不得改写或编造。\n';
+
+            for (let i = 0; i < detailedCases.length; i++) {
+                const caseItem = detailedCases[i];
+                const similarityText = caseItem.similarity !== null && caseItem.similarity !== undefined
+                    ? `｜相似度 ${caseItem.similarity}`
+                    : '';
+                casesContext += `\n### 案例${i + 1}：${caseItem.title}${similarityText}\n`;
+                casesContext += `- 案号：${caseItem.caseNumber}\n`;
+                casesContext += `- 法院：${caseItem.court}${caseItem.courtLevel ? `（${caseItem.courtLevel}法院）` : ''}\n`;
+                casesContext += `- 案件类别：${caseItem.caseType || '未标注'}｜文书种类：${caseItem.judgementType}\n`;
+                casesContext += `- 案由：${caseItem.causeName || '未标注'}\n`;
+                casesContext += `- 结案日期：${caseItem.judgementDate}｜审理程序：${caseItem.levelOfTrial}\n`;
+                if (caseItem.authority) {
+                    casesContext += `- 案例来源：${caseItem.authority}\n`;
+                }
+                if (caseItem.judges?.length) {
+                    casesContext += `- 审判人员：${caseItem.judges.join('、')}\n`;
+                }
+                if (caseItem.citedStatutes) {
+                    casesContext += `- 援引法条：${caseItem.citedStatutes}\n`;
+                }
+                if (caseItem.content) {
+                    const limit = detailedCases.length <= 2 ? 1600 : 900;
+                    const excerpt = caseItem.content.length > limit
+                        ? `${caseItem.content.slice(0, limit)}……（已截断）`
+                        : caseItem.content;
+                    casesContext += `\n**案例内容：**\n${excerpt}\n`;
                 }
             }
 
-            if (detailedCases.length > 0) {
-                let casesContext = '\n\n### 相关法律案例参考：\n';
-                for (let i = 0; i < detailedCases.length; i++) {
-                    const caseItem = detailedCases[i];
-                    casesContext += `\n**案例${i + 1}：${caseItem.title}**\n`;
-                    casesContext += `- 案号：${caseItem.caseNumber}\n`;
-                    casesContext += `- 法院：${caseItem.court}（${caseItem.levelOfTrial}）\n`;
-                    casesContext += `- 案由：${caseItem.cause}\n`;
-                    casesContext += `- 判决日期：${caseItem.judgementDate}\n`;
-
-                    if (caseItem.detail) {
-                        if (caseItem.detail.judgeInfo) {
-                            casesContext += `- 审判人员：${caseItem.detail.judgeInfo}\n`;
-                        }
-                        if (caseItem.detail.content) {
-                            casesContext += `- 案情要点：${caseItem.detail.content.substring(0, 300)}...\n`;
-                        }
-                    } else if (caseItem.content) {
-                        casesContext += `- 案情摘要：${caseItem.content.substring(0, 200)}...\n`;
-                    }
-                }
-
-                systemPromptAddon = '\n\n在回答时，请深入参考以下相关法律案例，分析其判决理由和法律适用，引用案例时请注明案号和法院：' + casesContext;
-            }
+            systemPromptAddon = casesContext;
         } else {
-            console.log('未找到相关案例');
+            console.log('未检索到相关案例');
         }
     } catch (error) {
         console.error('案例检索失败:', error);
@@ -384,87 +1067,62 @@ async function collectCaseContext(message: string, enableCaseSearch: boolean, ca
     return { systemPromptAddon, detailedCases };
 }
 
-function buildCaseAppendix(detailedCases: any[], enableCaseSearch: boolean): CaseAppendix {
-    let appendText = '';
-
-    if (detailedCases.length > 0) {
-        appendText += '\n\n---\n\n## 📚 相关法律案例参考\n\n';
-        appendText += `> 为您检索到 ${detailedCases.length} 个高度相关的法律案例，供参考：\n\n`;
-
-        for (let i = 0; i < detailedCases.length; i++) {
-            const caseItem = detailedCases[i];
-            appendText += `### 📋 案例 ${i + 1}\n\n**${caseItem.title}**\n\n`;
-            appendText += `**📋 案件基本信息**\n\n`;
-            appendText += `- **案号**：${caseItem.caseNumber}\n`;
-            appendText += `- **法院**：${caseItem.court}\n`;
-            appendText += `- **案件类型**：${caseItem.caseType || '民事案件'}\n`;
-            appendText += `- **案由**：${caseItem.causeName || caseItem.cause}\n`;
-            appendText += `- **文书类型**：${caseItem.judgementType}\n`;
-            appendText += `- **判决日期**：${caseItem.judgementDate}\n`;
-            appendText += `- **审理程序**：${caseItem.levelOfTrial || caseItem.levelOfTria}\n`;
-
-            appendText += `\n**📖 案情详情**\n\n`;
-            if (caseItem.detail && caseItem.detail.data && caseItem.detail.data.docResult) {
-                const docResult = caseItem.detail.data.docResult;
-                for (let j = 0; j < docResult.length; j++) {
-                    const section = docResult[j];
-                    if (section.label && section.text) {
-                        appendText += ` **${section.label}:**\n\n`;
-                        let cleanText = section.text.trim()
-                            .replace(/<em>/g, '')
-                            .replace(/<\/em>/g, '')
-                            .replace(/<strong>/g, '**')
-                            .replace(/<\/strong>/g, '**')
-                            .replace(/<[^>]+>/g, '');
-                        const formattedText = cleanText.replace(/\n/g, '  \n');
-                        appendText += `${formattedText}\n\n`;
-                        if (j < docResult.length - 1) {
-                            appendText += `---\n\n`;
-                        }
-                    }
-                }
-            } else if (caseItem.content) {
-                let cleanContent = caseItem.content.trim()
-                    .replace(/<em>/g, '')
-                    .replace(/<\/em>/g, '')
-                    .replace(/<strong>/g, '**')
-                    .replace(/<\/strong>/g, '**')
-                    .replace(/<[^>]+>/g, '');
-                const formattedContent = cleanContent.replace(/\n/g, '  \n');
-                appendText += `${formattedContent}\n`;
-            }
-
-            if (caseItem.detail && caseItem.detail.data && caseItem.detail.data.timelineNodes && caseItem.detail.data.timelineNodes.length > 0) {
-                appendText += `\n**⏱️ 审理时间轴**\n\n`;
-                for (const timeNode of caseItem.detail.data.timelineNodes.slice(0, 3)) {
-                    appendText += `- ${timeNode.date || timeNode.time}：${timeNode.event || timeNode.description}\n`;
-                }
-            }
-
-            if (i < detailedCases.length - 1) {
-                appendText += `\n---\n\n`;
-            } else {
-                appendText += `\n`;
-            }
-        }
-
-        appendText += `\n> 💡 **法律提示**：以上案例由法律案例库提供，仅供学习参考。每个案件具有特殊性，具体法律问题请咨询专业律师或法律机构，以获得针对性的法律意见。\n`;
-    } else if (!enableCaseSearch) {
-        appendText += `\n\n\n\n💡 如果您需要相似案情的案件信息，请启用输入框旁的"类案检索"。`;
+/** 剥离消息末尾的案例数据，避免回灌模型时污染上下文（兼容新旧两种格式） */
+function stripRelatedCasesMeta(content: string): string {
+    if (!content) return '';
+    let cleaned = content.replace(/<!--RELATED_CASES:[\s\S]*?-->\s*$/, '');
+    // 旧数据：案例附录曾被直接拼进正文
+    const legacyMarker = '## 📚 相关法律案例参考';
+    const legacyIndex = cleaned.indexOf(legacyMarker);
+    if (legacyIndex !== -1) {
+        cleaned = cleaned.slice(0, legacyIndex);
     }
+    return cleaned.trimEnd();
+}
 
-    return { appendText, caseCount: detailedCases.length };
+/**
+ * 案例卡片在历史回看时仍需还原，但不能再拼进回复正文——
+ * 用户要求案例只出现在检索阶段，正文保持模型原始输出。
+ * 这里用 HTML 注释承载案例数据：Markdown 渲染不会显示，前端解析后还原为卡片。
+ */
+function buildRelatedCasesMeta(cases: any[]): string {
+    if (!cases || cases.length === 0) return '';
+    const compact = cases.map(item => ({
+        title: item.title,
+        caseNumber: item.caseNumber,
+        court: item.court,
+        caseType: item.caseType,
+        causeName: item.causeName,
+        judgementType: item.judgementType,
+        judgementDate: item.judgementDate,
+        levelOfTrial: item.levelOfTrial,
+        similarity: item.similarity,
+        authority: item.authority,
+        content: item.content ? String(item.content).slice(0, 4000) : '',
+        detail: item.detail
+    }));
+    try {
+        // 避免注释里出现 --> 提前闭合
+        const json = JSON.stringify(compact).replace(/-->/g, '--\\u003e');
+        return `\n\n<!--RELATED_CASES:${json}-->`;
+    } catch (error) {
+        console.error('序列化案例数据失败:', error);
+        return '';
+    }
 }
 
 async function callModel(
     providerType: string,
     apiConfig: any,
     systemPrompt: string,
-    message: string
+    message: string,
+    enableThinking: boolean = false,
+    history: HistoryMessage[] = []  // 新增：历史消息参数
 ): Promise<ModelCallResult> {
     const startTime = Date.now();
 
     if (providerType === 'deepseek') {
+        const modelUsed = resolveDeepSeekModelName(apiConfig, enableThinking);
         const apiUrl = resolveApiUrl(
             apiConfig.api_endpoint,
             apiConfig.api_host,
@@ -477,7 +1135,24 @@ async function callModel(
         const parameters = (apiConfig.parameters && typeof apiConfig.parameters === 'object' && !Array.isArray(apiConfig.parameters))
             ? { ...(apiConfig.parameters as Record<string, any>) }
             : {};
-        const { max_tokens: dsMaxTokens, temperature: dsTemperature, stream: dsStream, ...deepseekRest } = parameters;
+        const {
+            max_tokens: dsMaxTokens,
+            temperature: dsTemperature,
+            stream: dsStream,
+            model: _ignoredParamModel,
+            messages: _ignoredParamMessages,
+            thinking: _ignoredParamThinking,
+            reasoning_effort: _ignoredParamEffort,
+            ...deepseekRest
+        } = parameters;
+
+        if (_ignoredParamModel) {
+            console.log('DeepSeek parameters.model 已忽略，模型由 model_name 决定');
+        }
+
+        // 构建多轮对话消息列表
+        const messages = buildMultiRoundMessages(systemPrompt, history, message);
+        console.log(`DeepSeek 多轮对话: 系统消息 + ${history.length} 条历史消息 + 当前消息`);
 
         const deepseekResponse = await fetch(apiUrl, {
             method: 'POST',
@@ -486,14 +1161,13 @@ async function callModel(
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({
-                model: apiConfig.model_name || 'deepseek-chat',
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: message }
-                ],
-                temperature: dsTemperature ?? 1.3,
-                max_tokens: dsMaxTokens ?? 1000,
+                model: modelUsed,
+                messages: messages,  // 使用多轮对话消息列表
+                temperature: dsTemperature ?? (enableThinking ? 0.95 : 1.0),
+                // 未显式配置 max_tokens 时不传该字段，交由模型决定输出长度
+                ...(typeof dsMaxTokens === 'number' ? { max_tokens: dsMaxTokens } : {}),
                 stream: dsStream ?? false,
+                ...buildDeepSeekThinkingParam(enableThinking),
                 ...deepseekRest
             })
         });
@@ -503,13 +1177,19 @@ async function callModel(
             throw new Error(`DeepSeek API调用失败: ${errorText}`);
         }
 
+        console.log('DeepSeek 非流式模型:', modelUsed, 'thinking:', enableThinking ? 'on' : 'off');
+
         const deepseekData = await deepseekResponse.json();
         const content = deepseekData.choices?.[0]?.message?.content || deepseekData.output_text || '';
+        const reasoningContent = deepseekData.choices?.[0]?.message?.reasoning_content || '';
         const tokensUsed = deepseekData.usage?.total_tokens || deepseekData.usage?.output_tokens || 0;
         return {
             content,
+            reasoningContent,
             tokensUsed,
-            responseTime: Date.now() - startTime
+            responseTime: Date.now() - startTime,
+            modelUsed,
+            truncated: deepseekData.choices?.[0]?.finish_reason === 'length'
         };
     }
 
@@ -528,6 +1208,10 @@ async function callModel(
         : {};
     const { max_tokens: qwenMaxTokens, temperature: qwenTemperature, ...qwenRest } = parameters;
 
+    // 构建多轮对话消息列表
+    const messages = buildMultiRoundMessages(systemPrompt, history, message);
+    console.log(`Qwen 多轮对话: 系统消息 + ${history.length} 条历史消息 + 当前消息`);
+
     const aliyunResponse = await fetch(apiUrl, {
         method: 'POST',
         headers: {
@@ -537,13 +1221,11 @@ async function callModel(
         body: JSON.stringify({
             model: apiConfig.model_name || 'qwen-turbo',
             input: {
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: message }
-                ]
+                messages: messages  // 使用多轮对话消息列表
             },
             parameters: {
-                max_tokens: qwenMaxTokens ?? 1000,
+                // 未显式配置 max_tokens 时不传该字段，交由模型决定输出长度
+                ...(typeof qwenMaxTokens === 'number' ? { max_tokens: qwenMaxTokens } : {}),
                 temperature: qwenTemperature ?? 0.7,
                 ...qwenRest
             }
@@ -562,7 +1244,9 @@ async function callModel(
     return {
         content,
         tokensUsed,
-        responseTime: Date.now() - startTime
+        responseTime: Date.now() - startTime,
+        modelUsed: apiConfig.model_name || 'qwen-turbo',
+        truncated: aliyunData.output?.finish_reason === 'length'
     };
 }
 
@@ -581,6 +1265,25 @@ async function processSSEStream(
     while (true) {
         const { value, done } = await reader.read();
         if (done) {
+            // 处理流结束时残留的最后一个事件，避免尾部内容丢失
+            if (buffer.trim()) {
+                const lines = buffer.trim().split('\n');
+                let eventName = 'message';
+                const dataLines: string[] = [];
+
+                for (const line of lines) {
+                    if (line.startsWith('event:')) {
+                        eventName = line.slice(6).trim();
+                    } else if (line.startsWith('data:')) {
+                        dataLines.push(line.slice(5).trim());
+                    }
+                }
+
+                const data = dataLines.join('\n');
+                if (data) {
+                    onEvent({ event: eventName, data });
+                }
+            }
             break;
         }
         buffer += decoder.decode(value, { stream: true });
@@ -622,28 +1325,42 @@ interface StreamModelOptions {
     apiConfig: any;
     systemPrompt: string;
     message: string;
+    enableThinking?: boolean;
     onToken: (chunk: string) => void;
+    onReasoningToken?: (chunk: string) => void;
+    history?: HistoryMessage[];  // 新增：历史消息参数
 }
 
 async function streamModelResponse(options: StreamModelOptions): Promise<ModelCallResult> {
-    const { providerType, apiConfig, systemPrompt, message, onToken } = options;
+    const { providerType, apiConfig, systemPrompt, message, enableThinking = false, onToken, onReasoningToken, history = [] } = options;
     const startTime = Date.now();
     let tokensUsed = 0;
     let accumulatedContent = '';
+    let accumulatedReasoning = '';
+    let latestReasoning = '';
+    let truncated = false;
 
-    const fallbackReturn = (content: string, usage?: any) => {
+    const fallbackReturn = (content: string, usage?: any, reasoningContent: string = '', modelUsed?: string, finishReason?: string) => {
+        if (reasoningContent) {
+            accumulatedReasoning += reasoningContent;
+            onReasoningToken?.(reasoningContent);
+        }
         if (content) {
             onToken(content);
         }
         const totalTokens = usage?.total_tokens || usage?.output_tokens || 0;
         return {
             content,
+            reasoningContent: accumulatedReasoning,
             tokensUsed: totalTokens,
-            responseTime: Date.now() - startTime
+            responseTime: Date.now() - startTime,
+            modelUsed,
+            truncated: finishReason === 'length'
         };
     };
 
     if (providerType === 'deepseek') {
+        const modelUsed = resolveDeepSeekModelName(apiConfig, enableThinking);
         const apiUrl = resolveApiUrl(
             apiConfig.api_endpoint,
             apiConfig.api_host,
@@ -655,7 +1372,24 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
         const parameters = (apiConfig.parameters && typeof apiConfig.parameters === 'object' && !Array.isArray(apiConfig.parameters))
             ? { ...(apiConfig.parameters as Record<string, any>) }
             : {};
-        const { max_tokens: dsMaxTokens, temperature: dsTemperature, ...deepseekRest } = parameters;
+        const {
+            max_tokens: dsMaxTokens,
+            temperature: dsTemperature,
+            model: _ignoredParamModel,
+            messages: _ignoredParamMessages,
+            stream: _ignoredParamStream,
+            thinking: _ignoredParamThinking,
+            reasoning_effort: _ignoredParamEffort,
+            ...deepseekRest
+        } = parameters;
+
+        if (_ignoredParamModel) {
+            console.log('DeepSeek parameters.model 已忽略，模型由 model_name 决定');
+        }
+
+        // 构建多轮对话消息列表
+        const messages = buildMultiRoundMessages(systemPrompt, history, message);
+        console.log(`DeepSeek 流式多轮对话: 系统消息 + ${history.length} 条历史消息 + 当前消息`);
 
         const response = await fetch(apiUrl, {
             method: 'POST',
@@ -665,14 +1399,13 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
                 'Accept': 'text/event-stream'
             },
             body: JSON.stringify({
-                model: apiConfig.model_name || 'deepseek-chat',
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: message }
-                ],
-                temperature: dsTemperature ?? 1.3,
-                max_tokens: dsMaxTokens ?? 1000,
+                model: modelUsed,
+                messages: messages,  // 使用多轮对话消息列表
+                temperature: dsTemperature ?? (enableThinking ? 0.95 : 1.0),
+                // 未显式配置 max_tokens 时不传该字段，交由模型决定输出长度
+                ...(typeof dsMaxTokens === 'number' ? { max_tokens: dsMaxTokens } : {}),
                 stream: true,
+                ...buildDeepSeekThinkingParam(enableThinking),
                 ...deepseekRest
             })
         });
@@ -682,11 +1415,14 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
             throw new Error(`DeepSeek API调用失败: ${errorText}`);
         }
 
+        console.log('DeepSeek 流式模型:', modelUsed, 'thinking:', enableThinking ? 'on' : 'off');
+
         const contentType = response.headers.get('content-type') || '';
         if (!contentType.includes('text/event-stream')) {
             const payload = await response.json();
             const content = payload.choices?.[0]?.message?.content || payload.output_text || '';
-            return fallbackReturn(content, payload.usage);
+            const reasoningContent = payload.choices?.[0]?.message?.reasoning_content || '';
+            return fallbackReturn(content, payload.usage, reasoningContent, modelUsed, payload.choices?.[0]?.finish_reason);
         }
 
         await processSSEStream(response, ({ data }) => {
@@ -709,15 +1445,43 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
                 onToken(delta);
             }
 
+            const reasoningDelta = payload.choices?.[0]?.delta?.reasoning_content || '';
+            const reasoningFull = payload.choices?.[0]?.message?.reasoning_content || '';
+            if (reasoningDelta) {
+                accumulatedReasoning += reasoningDelta;
+                latestReasoning = accumulatedReasoning;
+                onReasoningToken?.(reasoningDelta);
+            } else if (reasoningFull) {
+                if (reasoningFull.startsWith(latestReasoning)) {
+                    const extra = reasoningFull.slice(latestReasoning.length);
+                    if (extra) {
+                        accumulatedReasoning += extra;
+                        onReasoningToken?.(extra);
+                    }
+                } else {
+                    accumulatedReasoning += reasoningFull;
+                    onReasoningToken?.(reasoningFull);
+                }
+                latestReasoning = reasoningFull;
+            }
+
             if (payload.usage?.total_tokens) {
                 tokensUsed = payload.usage.total_tokens;
+            }
+
+            // DeepSeek 在流末尾的 chunk 里给出 finish_reason
+            if (payload.choices?.[0]?.finish_reason === 'length') {
+                truncated = true;
             }
         });
 
         return {
             content: accumulatedContent,
+            reasoningContent: accumulatedReasoning,
             tokensUsed,
-            responseTime: Date.now() - startTime
+            responseTime: Date.now() - startTime,
+            modelUsed,
+            truncated
         };
     }
 
@@ -735,6 +1499,10 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
         : {};
     const { max_tokens: qwenMaxTokens, temperature: qwenTemperature, ...qwenRest } = parameters;
 
+    // 构建多轮对话消息列表
+    const messages = buildMultiRoundMessages(systemPrompt, history, message);
+    console.log(`Qwen 流式多轮对话: 系统消息 + ${history.length} 条历史消息 + 当前消息`);
+
     const response = await fetch(apiUrl, {
         method: 'POST',
         headers: {
@@ -746,13 +1514,11 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
         body: JSON.stringify({
             model: apiConfig.model_name || 'qwen-turbo',
             input: {
-                messages: [
-                    { role: 'system', content: systemPrompt },
-                    { role: 'user', content: message }
-                ]
+                messages: messages  // 使用多轮对话消息列表
             },
             parameters: {
-                max_tokens: qwenMaxTokens ?? 1000,
+                // 未显式配置 max_tokens 时不传该字段，交由模型决定输出长度
+                ...(typeof qwenMaxTokens === 'number' ? { max_tokens: qwenMaxTokens } : {}),
                 temperature: qwenTemperature ?? 0.7,
                 ...qwenRest,
                 stream: true
@@ -852,8 +1618,11 @@ async function streamModelResponse(options: StreamModelOptions): Promise<ModelCa
 
     return {
         content: accumulatedContent,
+        reasoningContent: accumulatedReasoning,
         tokensUsed,
-        responseTime: Date.now() - startTime
+        responseTime: Date.now() - startTime,
+        modelUsed: apiConfig.model_name || 'qwen-turbo',
+        truncated
     };
 }
 
@@ -871,7 +1640,16 @@ Deno.serve(async (req) => {
     }
 
     try {
-        const { message, sessionId, userId, enableCaseSearch = true, provider: preferredProvider, stream = false, caseCount = 1 } = await req.json();
+        const {
+            message,
+            sessionId,
+            userId,
+            enableCaseSearch = true,
+            enableThinking = false,
+            provider: preferredProvider,
+            stream = false,
+            caseCount = 1
+        } = await req.json();
 
         if (!message || !sessionId) {
             throw new Error('消息内容和会话ID为必填项');
@@ -945,7 +1723,7 @@ Deno.serve(async (req) => {
             }
         });
 
-        let systemPrompt = "你是由吉林大学法学院与吉林大学计算机科学与技术学院联合开发的法律知识助手，致力于解答法律问题。请以聪明、友好而又可爱的方式回答用户的问题";
+        let systemPrompt = DEFAULT_SYSTEM_PROMPT;
         if (basePromptResponse.ok) {
             const basePrompts = await basePromptResponse.json();
             if (basePrompts && basePrompts.length > 0) {
@@ -964,8 +1742,35 @@ Deno.serve(async (req) => {
             content: message
         });
 
+        // 获取会话历史
+        // 注意：本轮用户消息已在上面写入 conversations，查询会把它一起取回来。
+        // 这里剔除末尾这条，否则既会让检索把"当前输入"当成上文，
+        // 也会让模型拿到重复的 user 消息。
+        console.log('正在获取会话历史...');
+        const rawHistory = await getConversationHistory(supabaseUrl, serviceRoleKey, sessionId, CONTEXT_CONFIG.MAX_ROUNDS);
+
+        const historyWithoutCurrent = (() => {
+            const list = [...rawHistory];
+            const last = list[list.length - 1];
+            if (last && last.role === 'user' && last.content === message) {
+                list.pop();
+            }
+            return list;
+        })();
+
+        // 应用上下文管理策略
+        const { managedHistory, warnings } = manageContextWindow(historyWithoutCurrent);
+
+        if (warnings.length > 0) {
+            console.log('上下文管理警告:', warnings);
+        }
+
+        console.log(`历史消息加载完成: ${rawHistory.length} 条原始消息 → ${managedHistory.length} 条上文消息（已剔除本轮输入）`);
+
         const providerType = normalizeProvider(apiConfig.api_provider) || 'qwen';
-        const caseContextPromise = collectCaseContext(message, enableCaseSearch, validCaseCount);
+        const validEnableThinking = providerType === 'deepseek' && Boolean(enableThinking);
+        console.log('Thinking模式:', validEnableThinking ? '启用' : '禁用');
+        const caseContextPromise = collectCaseContext(message, enableCaseSearch, validCaseCount, apiConfig, managedHistory);
 
         if (streamRequested) {
             return new Response(new ReadableStream({
@@ -976,38 +1781,53 @@ Deno.serve(async (req) => {
                     };
 
                     try {
+                        if (enableCaseSearch) {
+                            sendEvent('case-status', { status: 'searching', message: '正在为您检索相似案例' });
+                        }
+
+                        const caseData = await caseContextPromise;
+                        if (caseData.systemPromptAddon) {
+                            systemPrompt += caseData.systemPromptAddon;
+                        }
+
+                        if (enableCaseSearch) {
+                            sendEvent('related-cases', { cases: caseData.detailedCases || [] });
+                            sendEvent('case-status', {
+                                status: 'completed',
+                                message: caseData.detailedCases?.length
+                                    ? `已检索到 ${caseData.detailedCases.length} 个相关案例`
+                                    : '未检索到相关案例，将直接生成模型回复'
+                            });
+                        }
+
                         const modelResult = await streamModelResponse({
                             providerType,
                             apiConfig,
                             systemPrompt,
                             message,
+                            enableThinking: validEnableThinking,
+                            history: managedHistory,
                             onToken: (chunk) => {
                                 if (chunk) {
                                     sendEvent('token', { content: chunk });
                                 }
+                            },
+                            onReasoningToken: (chunk) => {
+                                if (chunk) {
+                                    sendEvent('reasoning-token', { content: chunk });
+                                }
                             }
                         });
 
-                        const caseData = await caseContextPromise;
-                        const caseAppendix = buildCaseAppendix(caseData.detailedCases, enableCaseSearch);
+                        // 案例只在检索阶段展示（前端 related-cases 面板），
+                        // 不再拼接进回复正文；仅以隐藏注释形式随消息落库，供历史回看还原。
+                        const relatedCasesMeta = buildRelatedCasesMeta(caseData.detailedCases);
+                        const truncationNotice = modelResult.truncated ? TRUNCATION_NOTICE : '';
+                        const finalResponse = modelResult.content + truncationNotice + relatedCasesMeta;
 
-                        if (enableCaseSearch && caseAppendix.appendText) {
-                            sendEvent('case-status', { status: 'searching', message: '正在为您检索相似案例' });
-                            for (const chunk of chunkTextForStream(caseAppendix.appendText)) {
-                                if (chunk) {
-                                    sendEvent('token', { content: chunk });
-                                }
-                            }
-                            sendEvent('case-status', { status: 'completed' });
-                        } else if (caseAppendix.appendText) {
-                            for (const chunk of chunkTextForStream(caseAppendix.appendText)) {
-                                if (chunk) {
-                                    sendEvent('token', { content: chunk });
-                                }
-                            }
+                        if (modelResult.truncated) {
+                            sendEvent('token', { content: truncationNotice });
                         }
-
-                        const finalResponse = modelResult.content + caseAppendix.appendText;
 
                         await saveConversationMessage({
                             supabaseUrl,
@@ -1018,7 +1838,7 @@ Deno.serve(async (req) => {
                             content: finalResponse,
                             metadata: {
                                 apiProviderUsed: apiConfig.api_provider,
-                                modelUsed: apiConfig.model_name,
+                                modelUsed: modelResult.modelUsed || apiConfig.model_name,
                                 tokensUsed: modelResult.tokensUsed,
                                 responseTime: modelResult.responseTime
                             }
@@ -1027,10 +1847,11 @@ Deno.serve(async (req) => {
                         sendEvent('done', {
                             tokensUsed: modelResult.tokensUsed,
                             responseTime: modelResult.responseTime,
-                            caseCount: caseAppendix.caseCount,
+                            caseCount: caseData.detailedCases.length,
                             apiProvider: apiConfig.api_provider,
-                            model: apiConfig.model_name,
-                            relatedCases: caseData.detailedCases
+                            model: modelResult.modelUsed || apiConfig.model_name,
+                            relatedCases: caseData.detailedCases,
+                            reasoningContent: modelResult.reasoningContent || ''
                         });
                     } catch (error: any) {
                         console.error('流式响应错误:', error);
@@ -1056,9 +1877,11 @@ Deno.serve(async (req) => {
             systemPrompt += caseData.systemPromptAddon;
         }
 
-        const modelResult = await callModel(providerType, apiConfig, systemPrompt, message);
-        const caseAppendix = buildCaseAppendix(caseData.detailedCases, enableCaseSearch);
-        const finalResponse = modelResult.content + caseAppendix.appendText;
+        const modelResult = await callModel(providerType, apiConfig, systemPrompt, message, validEnableThinking, managedHistory);
+        // 同流式分支：案例不再拼进正文，只作为隐藏元数据随消息落库
+        const relatedCasesMeta = buildRelatedCasesMeta(caseData.detailedCases);
+        const truncationNotice = modelResult.truncated ? TRUNCATION_NOTICE : '';
+        const finalResponse = modelResult.content + truncationNotice + relatedCasesMeta;
 
         await saveConversationMessage({
             supabaseUrl,
@@ -1069,7 +1892,7 @@ Deno.serve(async (req) => {
             content: finalResponse,
             metadata: {
                 apiProviderUsed: apiConfig.api_provider,
-                modelUsed: apiConfig.model_name,
+                modelUsed: modelResult.modelUsed || apiConfig.model_name,
                 tokensUsed: modelResult.tokensUsed,
                 responseTime: modelResult.responseTime
             }
@@ -1082,9 +1905,10 @@ Deno.serve(async (req) => {
                 tokensUsed: modelResult.tokensUsed,
                 responseTime: modelResult.responseTime,
                 apiProvider: apiConfig.api_provider,
-                model: apiConfig.model_name,
+                model: modelResult.modelUsed || apiConfig.model_name,
                 relatedCases: caseData.detailedCases,
-                caseCount: caseAppendix.caseCount
+                caseCount: caseData.detailedCases.length,
+                reasoningContent: modelResult.reasoningContent || ''
             }
         }), {
             headers: { ...corsHeaders, 'Content-Type': 'application/json' }

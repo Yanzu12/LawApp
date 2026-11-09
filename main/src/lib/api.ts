@@ -4,6 +4,8 @@ const SUPABASE_FUNCTION_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1
 
 type StreamEventHandler = {
   onToken?: (chunk: string) => void;
+  onThinkingToken?: (chunk: string) => void;
+  onRelatedCases?: (cases: any[]) => void;
   onCaseStatus?: (payload: { status: string; message?: string }) => void;
   onDone?: (payload: {
     tokensUsed?: number;
@@ -12,6 +14,7 @@ type StreamEventHandler = {
     apiProvider?: string;
     model?: string;
     relatedCases?: any[];
+    reasoningContent?: string;
   }) => void;
   onError?: (message: string) => void;
 };
@@ -21,6 +24,7 @@ interface StreamParams {
   sessionId: string;
   userId?: string;
   enableCaseSearch?: boolean;
+  enableThinking?: boolean;
   provider?: string;
   caseCount?: number;
 }
@@ -44,6 +48,7 @@ export const sendChatMessageStream = async (
         sessionId: params.sessionId,
         userId: params.userId,
         enableCaseSearch: params.enableCaseSearch ?? true,
+        enableThinking: params.enableThinking ?? false,
         provider: params.provider,
         caseCount: params.caseCount ?? 1,
         stream: true
@@ -96,6 +101,14 @@ export const sendChatMessageStream = async (
             handlers.onToken?.(payload.content);
           }
           break;
+        case 'reasoning-token':
+          if (payload?.content) {
+            handlers.onThinkingToken?.(payload.content);
+          }
+          break;
+        case 'related-cases':
+          handlers.onRelatedCases?.(Array.isArray(payload?.cases) ? payload.cases : []);
+          break;
         case 'case-status':
           if (payload?.status) {
             handlers.onCaseStatus?.(payload);
@@ -114,7 +127,13 @@ export const sendChatMessageStream = async (
 
     while (true) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) {
+        // 处理流结束时可能残留在缓冲区中的最后一个事件
+        if (buffer.trim()) {
+          processEvent(buffer.trim());
+        }
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       let boundary = buffer.indexOf('\n\n');

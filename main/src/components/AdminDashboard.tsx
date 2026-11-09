@@ -381,7 +381,7 @@ const AdminDashboard: React.FC = () => {
                       defaultModel = 'qwen-turbo';
                     } else if (provider === 'DeepSeek') {
                       defaultHost = 'https://api.deepseek.com';
-                      defaultModel = 'deepseek-chat';
+                      defaultModel = 'deepseek-flash';
                     }
                     
                     setNewConfig({ 

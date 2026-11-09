@@ -29,19 +29,24 @@ serve(async (req) => {
     }
 
     // 如果提供了 sessionId，获取特定会话的历史
+    // 注意：必须按 created_at 倒序取“最近 N 条”，再在内存中翻转成时间正序。
+    // 若直接用 order asc + limit，用户记录超过 limit 条时会把最新消息全部截掉，
+    // 表现为“新消息没有写入库”。
+    const effectiveLimit = Math.min(Math.max(Number(limit) || 50, 1), 500);
+
     let query = supabase
       .from('conversations')
       .select('*')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true });
+      .eq('user_id', userId);
 
     if (sessionId) {
       query = query.eq('session_id', sessionId);
     }
 
-    query = query.limit(limit);
-
-    const { data: conversations, error } = await query;
+    const { data: fetched, error } = await query
+      .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(effectiveLimit);
 
     if (error) {
       console.error('获取对话历史失败:', error);
@@ -52,6 +57,9 @@ serve(async (req) => {
         headers: { ...corsHeaders, 'Content-Type': 'application/json' }
       });
     }
+
+    // 翻转回时间正序，前端按顺序渲染
+    const conversations = (fetched || []).slice().reverse();
 
     // 返回对话历史
     return new Response(JSON.stringify({

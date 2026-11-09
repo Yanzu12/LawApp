@@ -17,44 +17,35 @@ module.exports = {
 		},
 		extend: {
 			colors: {
-				border: 'hsl(var(--border))',
-				input: 'hsl(var(--input))',
-				ring: 'hsl(var(--ring))',
-				background: 'hsl(var(--background))',
-				foreground: 'hsl(var(--foreground))',
-				primary: {
-					DEFAULT: '#2B5D3A',
-					foreground: 'hsl(var(--primary-foreground))',
-				},
-				secondary: {
-					DEFAULT: '#4A90E2',
-					foreground: 'hsl(var(--secondary-foreground))',
-				},
-				accent: {
-					DEFAULT: '#F5A623',
-					foreground: 'hsl(var(--accent-foreground))',
-				},
-				destructive: {
-					DEFAULT: 'hsl(var(--destructive))',
-					foreground: 'hsl(var(--destructive-foreground))',
-				},
-				muted: {
-					DEFAULT: 'hsl(var(--muted))',
-					foreground: 'hsl(var(--muted-foreground))',
-				},
-				popover: {
-					DEFAULT: 'hsl(var(--popover))',
-					foreground: 'hsl(var(--popover-foreground))',
-				},
-				card: {
-					DEFAULT: 'hsl(var(--card))',
-					foreground: 'hsl(var(--card-foreground))',
-				},
+				paper: 'var(--paper)',
+				'paper-deep': 'var(--paper-deep)',
+				card: 'var(--card)',
+				'card-2': 'var(--card-2)',
+				ink: 'var(--ink)',
+				'ink-2': 'var(--ink-2)',
+				'ink-3': 'var(--ink-3)',
+				rule: 'var(--rule)',
+				'rule-strong': 'var(--rule-strong)',
+				action: 'var(--action)',
+				'action-ink': 'var(--action-ink)',
+				'action-soft': 'var(--action-soft)',
+				seal: 'var(--seal)',
+				'seal-ink': 'var(--seal-ink)',
+				'seal-soft': 'var(--seal-soft)',
+				ok: 'var(--ok)',
+				'ok-ink': 'var(--ok-ink)',
+				'ok-soft': 'var(--ok-soft)',
+				warn: 'var(--warn)',
+				'warn-ink': 'var(--warn-ink)',
+				'warn-soft': 'var(--warn-soft)',
+			},
+			fontFamily: {
+				sans: 'var(--font-sans)',
+				serif: 'var(--font-serif)',
+				mono: 'var(--font-mono)',
 			},
 			borderRadius: {
-				lg: 'var(--radius)',
-				md: 'calc(var(--radius) - 2px)',
-				sm: 'calc(var(--radius) - 4px)',
+				DEFAULT: 'var(--radius)',
 			},
 			keyframes: {
 				'accordion-down': {

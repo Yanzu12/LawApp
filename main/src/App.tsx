@@ -15,8 +15,8 @@ const AdminRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-gray-500">加载中...</div>
+      <div className="min-h-screen flex items-center justify-center bg-paper">
+        <div className="entry-line">正在校验…</div>
       </div>
     );
   }
@@ -30,8 +30,8 @@ const AdminLoginRoute: React.FC<{ children: React.ReactNode }> = ({ children }) 
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="text-gray-500">加载中...</div>
+      <div className="min-h-screen flex items-center justify-center bg-paper">
+        <div className="entry-line">正在校验…</div>
       </div>
     );
   }
@@ -45,8 +45,8 @@ const UserRoute: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-blue-100 to-indigo-50">
-        <div className="text-gray-500">加载中...</div>
+      <div className="min-h-screen flex items-center justify-center bg-paper">
+        <div className="entry-line">正在校验…</div>
       </div>
     );
   }
@@ -60,8 +60,8 @@ const UserLoginRoute: React.FC<{ children: React.ReactNode }> = ({ children }) =
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-blue-50 via-blue-100 to-indigo-50">
-        <div className="text-gray-500">加载中...</div>
+      <div className="min-h-screen flex items-center justify-center bg-paper">
+        <div className="entry-line">正在校验…</div>
       </div>
     );
   }
